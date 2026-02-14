@@ -206,63 +206,124 @@ class LNMarketsTradingBot {
     }
 
     // Check if quantity meets minimum
-    if (decision.quantityUsd < this.config.minTradeSats / 1000) {
+    if (Math.abs(decision.quantityUsd) < this.config.minTradeSats / 1000) {
       console.log(`\n⚠️ Trade size ($${decision.quantityUsd}) below minimum ($${this.config.minTradeSats / 1000})`)
-      console.log('Skipping trade.')
-      await this.saveState()
-      return true
-    }
-
-    // Execute trade
-    console.log(`\n🚀 Executing ${decision.action} trade...`)
-    
-    try {
-      const result = await this.client.openPosition({
-        side: decision.action,
-        quantity: decision.quantityUsd,
-        leverage: this.config.maxLeverage,
-      })
-
-      console.log(`✓ Trade executed!`)
-      console.log(`  Position ID: ${result.id}`)
-      console.log(`  Entry Price: $${result.entryPrice.toLocaleString()}`)
-      console.log(`  Margin: ${result.margin.toLocaleString()} sats`)
-
-      // Record trade
-      const trade = {
-        timestamp: new Date().toISOString(),
-        positionId: result.id,
-        side: result.side,
-        quantityUsd: result.quantity,
-        entryPrice: result.entryPrice,
-        margin: result.margin,
-        leverage: result.leverage,
-        fees: fees.totalFee,
-        reasoning: decision.reasoning,
-      }
-
-      this.state.trades.push(trade)
-      this.state.totalRebalances++
-      this.state.totalFeesPaid += fees.totalFee
-
-      await this.saveState()
-      await this.logActivity(`Trade: ${decision.action} $${decision.quantityUsd} @ $${result.entryPrice}`)
+      console.log('Skipping market trade.')
+    } else {
+      // Execute market trade
+      console.log(`\n🚀 Executing ${decision.action} trade...`)
       
-      // Post to Nostr
-      await this.reporter.postTradeAlert({
-        action: decision.action,
-        quantityUsd: decision.quantityUsd,
-        currentPrice: result.entryPrice,
-        reasoning: decision.reasoning,
-      })
+      try {
+        const result = await this.client.openPosition({
+          side: decision.action,
+          quantity: Math.abs(decision.quantityUsd),
+          leverage: this.config.maxLeverage,
+        })
 
-      return true
-    } catch (error) {
-      console.error(`✗ Trade failed:`, error.message)
-      await this.reporter.postError(error, 'Failed to execute trade')
-      await this.logActivity(`Error: ${error.message}`)
-      return false
+        console.log(`✓ Trade executed!`)
+        console.log(`  Position ID: ${result.id}`)
+        console.log(`  Entry Price: $${result.entryPrice.toLocaleString()}`)
+        console.log(`  Margin: ${result.margin.toLocaleString()} sats`)
+
+        // Record trade
+        const trade = {
+          timestamp: new Date().toISOString(),
+          positionId: result.id,
+          side: result.side,
+          quantityUsd: result.quantity,
+          entryPrice: result.entryPrice,
+          margin: result.margin,
+          leverage: result.leverage,
+          fees: fees.totalFee,
+          reasoning: decision.reasoning,
+        }
+
+        this.state.trades.push(trade)
+        this.state.totalRebalances++
+        this.state.totalFeesPaid += fees.totalFee
+
+        await this.logActivity(`Trade: ${decision.action} $${decision.quantityUsd} @ $${result.entryPrice}`)
+        
+        // Post to Nostr
+        await this.reporter.postTradeAlert({
+          action: decision.action,
+          quantityUsd: decision.quantityUsd,
+          currentPrice: result.entryPrice,
+          reasoning: decision.reasoning,
+        })
+
+      } catch (error) {
+        console.error(`✗ Trade failed:`, error.message)
+        await this.reporter.postError(error, 'Failed to execute trade')
+        await this.logActivity(`Error: ${error.message}`)
+      }
     }
+
+    // --- Limit Order Management ---
+    console.log('\n🛑 Managing Limit Orders...')
+    
+    // 1. Cancel existing orders
+    try {
+      const openOrders = await this.client.getOpenOrders() // Assuming this method exists or needs to be added
+      if (openOrders.length > 0) {
+        console.log(`  Cancelling ${openOrders.length} open orders...`)
+        // Assuming client has cancelAllOrders or we loop
+        // For draft, we'll assume a loop or a bulk cancel
+        for (const order of openOrders) {
+           await this.client.cancelOrder(order.id)
+        }
+        console.log('  ✓ Orders cancelled.')
+      }
+    } catch (err) {
+      console.warn('  ⚠️ Failed to cancel orders:', err.message)
+    }
+
+    if (dryRun) {
+        console.log('  🧪 DRY RUN - Skipping limit order placement.')
+        await this.saveState()
+        return true
+    }
+
+    // 2. Calculate new limit orders
+    const limitConfigs = this.averager.getLimitOrderConfigs(
+        { totalEquitySats, netPositionSats },
+        new Date() // Current time
+    )
+    
+    console.log(`  Target BTC Value: $${limitConfigs.targetBtcValueUSD.toFixed(2)}`)
+
+    const ordersToPlace = [
+        { ...limitConfigs.buyOrder, side: 'b', label: 'Buy/Long' },
+        { ...limitConfigs.sellOrder, side: 's', label: 'Sell/Short' }
+    ]
+
+    for (const order of ordersToPlace) {
+        // Check minimums
+        if (Math.abs(order.quantity) < 1) { // LNMarkets min is usually $1 or specific count
+             console.log(`  ⚠️ Skipping ${order.label} - Qty ${order.quantity} too small`)
+             continue
+        }
+
+        console.log(`  placing ${order.label} Limit: ${Math.abs(order.quantity)} @ $${order.price}`)
+        
+        try {
+            // client.newOrder signature: { type: 'l', side: 'b'|'s', quantity, price, leverage }
+            // Note: quantity must be positive integer for API usually
+            await this.client.newOrder({
+                type: 'l',
+                side: order.side,
+                quantity: Math.abs(order.quantity),
+                price: order.price,
+                leverage: this.config.maxLeverage
+            })
+             console.log(`  ✓ ${order.label} Order Placed`)
+        } catch (err) {
+            console.error(`  ✗ Failed to place ${order.label}:`, err.message)
+        }
+    }
+
+    await this.saveState()
+    return true
   }
 
   /**

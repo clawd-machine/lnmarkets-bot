@@ -6,8 +6,9 @@ export default {
   targetBtcAllocation: 0.5,      // Target 50% in BTC equivalent (rest USD-equivalent)
   
   // Value averaging parameters
-  targetGrowthRate: 0.01,       // 0.8% monthly growth rate (conservative)
-  rebalanceThreshold: 0.04,      // Rebalance when 5% off target value
+  initial_btc_value_usd: 10000,   // Starting target value in USD
+  target_growth_rate_daily: 0.001, // 0.1% daily growth
+  limit_order_threshold: 0.04,     // Rebalance when 4% off target value
   
   // Trading parameters
   maxLeverage: 1,                // No leverage (safety first)

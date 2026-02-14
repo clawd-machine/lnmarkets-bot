@@ -1,0 +1,27 @@
+{
+  "name": "lnmarkets-value-averaging-bot",
+  "version": "1.0.0",
+  "description": "Automated value averaging trading bot for LNMarkets",
+  "type": "module",
+  "main": "bot.js",
+  "scripts": {
+    "init": "node bot.js init",
+    "status": "node bot.js status",
+    "rebalance": "node bot.js rebalance",
+    "test": "node bot.js rebalance --dry-run",
+    "report": "node bot.js report",
+    "setup-cron": "node bot.js setup-cron"
+  },
+  "keywords": [
+    "bitcoin",
+    "trading",
+    "lnmarkets",
+    "value-averaging",
+    "automation"
+  ],
+  "author": "Clawd 🪝",
+  "license": "MIT",
+  "dependencies": {
+    "@ln-markets/api": "^3.0.1"
+  }
+}

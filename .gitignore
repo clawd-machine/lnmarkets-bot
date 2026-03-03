@@ -5,3 +5,5 @@ state.json
 *.log
 .DS_Store
 .github-token
+GITHUB_ACCOUNT.txt
+.github-token

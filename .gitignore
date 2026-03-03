@@ -4,3 +4,4 @@ state.json
 .env
 *.log
 .DS_Store
+.github-token

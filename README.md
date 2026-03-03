@@ -115,18 +115,23 @@ npm install @ln-markets/api
 1. **Get LNMarkets API credentials**:
    - Visit https://app.lnmarkets.com/user/api
    - Create API key with "Read" and "Trade Futures" permissions
-   - Save credentials to `.env` file
+   - Copy `credentials.json.example` to `credentials.json`
+   - Fill in your API key, secret, and passphrase
 
-2. **Fund account**:
+2. **Install Dependencies**:
+   - The bot requires the `clawdzap` skill for Nostr reporting. Ensure it is installed at `../skills/clawdzap`.
+   - Run `npm install` inside the `lnmarkets-bot` directory.
+
+3. **Fund account**:
    - Deposit 200,000+ sats to LNMarkets
    - Verify balance via bot status command
 
-3. **Initialize bot**:
+4. **Initialize bot**:
    ```bash
    node bot.js init
    ```
 
-4. **Set up cron job**:
+5. **Set up cron job**:
    ```bash
    node bot.js setup-cron
    ```
@@ -137,10 +142,9 @@ npm install @ln-markets/api
 - `config.js` - Configuration and constants
 - `state.json` - Persistent state (positions, history)
 - `credentials.json` - API keys (gitignored)
-- `.env` - Environment variables (gitignored)
 - `lib/lnm-client.js` - LNMarkets API wrapper
 - `lib/value-averaging.js` - VA calculation engine
-- `lib/nostr-reporter.js` - Nostr posting integration
+- `lib/nostr-reporter.js` - Nostr posting integration (requires `clawdzap` skill)
 
 ## Commands
 

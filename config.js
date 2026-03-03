@@ -6,14 +6,15 @@ export default {
   targetBtcAllocation: 0.5,      // Target 50% in BTC equivalent (rest USD-equivalent)
   
   // Value averaging parameters
-  initial_btc_value_usd: 10000,   // Starting target value in USD
+  initial_btc_value_usd: 70,       // Starting target value in USD (50% of 200k sats @ $70k)
   target_growth_rate_daily: 0.001, // 0.1% daily growth
-  limit_order_threshold: 0.04,     // Rebalance when 4% off target value
+  limit_order_threshold: 0.015,     // Place limit orders when 1% off target
+  market_rebalance_threshold: 0.01, // Immediate market rebalance when 2% off target
   
   // Trading parameters
   maxLeverage: 1,                // No leverage (safety first)
-  minTradeSats: 10000,           // Minimum trade size (100k sats)
-  maxPositionSize: 1,          // Max 60% of capital in any position
+  minTradeSats: 100,           // Minimum trade size (100 sats)
+  maxPositionSize: 1,          // Max 100% of capital in any position
   
   // Timing and intervals
   checkInterval: 4 * 60 * 60 * 1000,  // Check every 4 hours (in ms)
@@ -50,7 +51,7 @@ export default {
   },
   
   // Persistence
-  stateFile: './state.json',
-  credentialsFile: './credentials.json',
-  logFile: '../memory/lnmarkets-trading.md',
+  stateFile: new URL('./state.json', import.meta.url).pathname,
+  credentialsFile: new URL('./credentials.json', import.meta.url).pathname,
+  logFile: new URL('../memory/lnmarkets-trading.md', import.meta.url).pathname,
 }

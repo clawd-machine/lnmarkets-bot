@@ -1,4 +1,4 @@
-#!/usr/bin/env node
+#! /usr/bin/env node
 
 // LNMarkets Value Averaging Trading Bot
 
@@ -33,6 +33,12 @@ class LNMarketsTradingBot {
       if (this.state.startDate) {
         this.state.startDate = new Date(this.state.startDate)
         this.averager.initialize(this.state.startDate)
+      }
+
+      // Migrate legacy keys
+      if (this.state.totalRebalances !== undefined && this.state.marketRebalances === undefined) {
+          this.state.marketRebalances = this.state.totalRebalances;
+          delete this.state.totalRebalances;
       }
       
       console.log('✓ State loaded from disk')
@@ -105,20 +111,25 @@ class LNMarketsTradingBot {
       trades: [],
       checks: [],
       totalFeesPaid: 0,
-      totalRebalances: 0,
+      marketRebalances: 0,
       lastCheck: null,
       version: '1.0.0',
     }
-
+    
+    // Logic for initialization is fresh, so no migration needed here.
+    // Migration logic should be in loadState if anywhere.
+    
     this.averager.initialize(startDate)
     await this.saveState()
 
     console.log('✓ Bot initialized!')
     console.log('\nConfiguration:')
     console.log(`  Capital: ${this.state.initialCapital.toLocaleString()} sats`)
-    console.log(`  Target BTC allocation: ${(this.config.targetBtcAllocation * 100).toFixed(0)}%`)
+    console.log(`  Target BTC allocation: ${(this.config.targetBtcAllocation * 100).toFixed(1)}%`)
     console.log(`  Target growth rate: ${(this.config.targetGrowthRate * 100).toFixed(2)}%/month`)
-    console.log(`  Rebalance threshold: ${(this.config.rebalanceThreshold * 100).toFixed(0)}%`)
+    // Update config log to match new config keys
+    console.log(`  Limit Order Threshold: ${(this.config.limit_order_threshold * 100).toFixed(1)}%`)
+    console.log(`  Market Rebalance Threshold: ${(this.config.market_rebalance_threshold * 100).toFixed(1)}%`)
     console.log(`  Max leverage: ${this.config.maxLeverage}x`)
     console.log(`  Check interval: ${this.config.checkInterval / (60 * 60 * 1000)} hours\n`)
 
@@ -144,24 +155,26 @@ class LNMarketsTradingBot {
     
     // Get current state from LNMarkets
     const currentState = await this.client.getCurrentState()
-    const { currentPrice, btcStackSats, usdBalanceSats, unrealizedPnL, positions, totalEquitySats, netPositionSats } = currentState
+    const { currentPrice, btcStackSats, usdBalanceSats, unrealizedPnL, positions, totalEquitySats, netPositionSats, netPositionUsd } = currentState
 
     console.log(`\nCurrent Price: $${currentPrice.toLocaleString()}`)
     console.log(`Total Equity: ${totalEquitySats.toLocaleString()} sats`)
     console.log(`BTC Exposure: ${(btcStackSats / 100_000_000).toFixed(8)} BTC (${btcStackSats.toLocaleString()} sats)`)
-    console.log(`Net Position: ${netPositionSats.toLocaleString()} sats`)
+    console.log(`Net Position (Sats): ${netPositionSats.toLocaleString()} sats`)
+    // NetPositionUsd is negative for short (hedged) positions. Display as positive "USD Dry Powder".
+    console.log(`USD Dry Powder: $${Math.abs(netPositionUsd || 0).toLocaleString()} USD`)
     console.log(`Unrealized P&L: ${unrealizedPnL >= 0 ? '+' : ''}${unrealizedPnL.toLocaleString()} sats`)
     console.log(`Open Positions: ${positions.length}`)
 
     // Calculate rebalance decision
     const decision = this.averager.calculateRebalance(
-      { totalEquitySats, netPositionSats },
+      currentState, // Pass full state including netPositionUsd
       currentPrice
     )
 
     console.log(`\n📊 Analysis:`)
-    console.log(`  Current Value: ${decision.metrics.currentValue.toLocaleString()} sats`)
-    console.log(`  Target Value: ${decision.metrics.targetValue.toLocaleString()} sats`)
+    console.log(`  Current Value: $${decision.metrics.currentValue.toLocaleString()}`)
+    console.log(`  Target Value: $${decision.metrics.targetValue.toLocaleString()}`)
     console.log(`  Current BTC: ${(btcStackSats / 100_000_000).toFixed(8)} BTC`)
     console.log(`  Target BTC: ${(decision.metrics.targetBtcSats / 100_000_000).toFixed(8)} BTC`)
     console.log(`  BTC Deviation: ${(decision.metrics.btcDeviation * 100).toFixed(2)}%`)
@@ -182,7 +195,68 @@ class LNMarketsTradingBot {
 
     if (!decision.needsRebalance) {
       console.log(`\n✓ ${decision.reasoning}`)
-      console.log('No rebalance needed.')
+      console.log('No immediate market rebalance needed.')
+
+      // --- Limit Order Logic ---
+      console.log(`\n🛡️  Checking Guard Rail Limit Orders...`)
+      
+      const limitConfigs = this.averager.getLimitOrderConfigs(
+        { totalEquitySats, netPositionSats, currentPrice, netPositionUsd },
+        new Date()
+      )
+
+      console.log(`  Buy Trigger: $${limitConfigs.buyOrder.price.toLocaleString()} (Qty: ${limitConfigs.buyOrder.quantity})`)
+      console.log(`  Sell Trigger: $${limitConfigs.sellOrder.price.toLocaleString()} (Qty: ${limitConfigs.sellOrder.quantity})`)
+
+      if (dryRun) {
+        console.log(`  [DRY RUN] Would cancel existing orders and place:`)
+        console.log(`    - LIMIT BUY ${limitConfigs.buyOrder.quantity} @ ${limitConfigs.buyOrder.price}`)
+        console.log(`    - LIMIT SELL ${Math.abs(limitConfigs.sellOrder.quantity)} @ ${limitConfigs.sellOrder.price}`)
+      } else {
+        // 1. Cancel existing orders
+        try {
+          const openOrders = await this.client.getOpenOrders()
+          if (openOrders.length > 0) {
+            console.log(`  Cancelling ${openOrders.length} open orders...`)
+            for (const order of openOrders) {
+               await this.client.cancelOrder(order.id)
+            }
+            console.log('  ✓ Orders cancelled.')
+          }
+        } catch (err) {
+          console.warn('  ⚠️ Failed to cancel orders:', err.message)
+        }
+
+        // 2. Place new orders
+        const ordersToPlace = [
+            { ...limitConfigs.buyOrder, side: 'b', label: 'Buy/Long' },
+            { ...limitConfigs.sellOrder, side: 's', label: 'Sell/Short' }
+        ]
+
+        for (const order of ordersToPlace) {
+            if (Math.abs(order.quantity) < 1) {
+                 console.log(`  ⚠️ Skipping ${order.label} - Qty ${order.quantity} too small`)
+                 continue
+            }
+
+            console.log(`  Placing ${order.label} Limit: ${Math.abs(order.quantity)} @ $${order.price}`)
+            
+            try {
+                await this.client.newOrder({
+                    type: 'l',
+                    side: order.side,
+                    quantity: Math.abs(order.quantity),
+                    price: order.price,
+                    leverage: this.config.maxLeverage
+                })
+                 console.log(`  ✓ ${order.label} Order Placed`)
+            } catch (err) {
+                console.error(`  ✗ Failed to place ${order.label}:`, err.message)
+            }
+        }
+      }
+      // -------------------------
+
       await this.saveState()
       await this.logActivity(`Check: ${decision.reasoning}`)
       return true
@@ -194,7 +268,7 @@ class LNMarketsTradingBot {
     console.log(`  Reasoning: ${decision.reasoning}`)
 
     // Calculate fees
-    const fees = this.averager.estimateFees(decision.quantityUsd, this.config.fees.trading.tier1)
+    const fees = this.averager.estimateFees(decision.quantityUsd, this.config.fees.trading.tier1, currentPrice)
     console.log(`\n💰 Estimated Fees:`)
     console.log(`  Open: ${fees.openFee} sats`)
     console.log(`  Close: ${fees.closeFee} sats`)
@@ -206,55 +280,131 @@ class LNMarketsTradingBot {
     }
 
     // Check if quantity meets minimum
+    // Note: This check applies to the NET change required.
+    // If we close positions, we might not need to open anything new, or open less.
     if (Math.abs(decision.quantityUsd) < this.config.minTradeSats / 1000) {
-      console.log(`\n⚠️ Trade size ($${decision.quantityUsd}) below minimum ($${this.config.minTradeSats / 1000})`)
-      console.log('Skipping market trade.')
+      console.log(`\n⚠️ Net trade size ($${decision.quantityUsd}) below minimum ($${this.config.minTradeSats / 1000})`)
+      console.log('Skipping rebalance.')
     } else {
-      // Execute market trade
-      console.log(`\n🚀 Executing ${decision.action} trade...`)
+      console.log(`\n🚀 Executing Rebalance...`)
       
       try {
-        const result = await this.client.openPosition({
-          side: decision.action,
-          quantity: Math.abs(decision.quantityUsd),
-          leverage: this.config.maxLeverage,
-        })
+        let remainingUsdToExecute = decision.quantityUsd;
+        
+        // 1. Check for opposite positions to close/reduce
+        // If we want to BUY (+), we look for SHORTS ('s') to close.
+        // If we want to SELL (-), we look for LONGS ('b') to close.
+        const targetSideToClose = remainingUsdToExecute > 0 ? 's' : 'b';
+        
+        // Refresh positions to be safe
+        const currentPositions = await this.client.getPositions();
+        
+        // Filter for opposite side
+        const oppositePositions = currentPositions.filter(p => {
+            const side = (p.side === 'b' || p.side === 'buy' || p.side === 'long') ? 'b' : 's';
+            return side === targetSideToClose;
+        });
 
-        console.log(`✓ Trade executed!`)
-        console.log(`  Position ID: ${result.id}`)
-        console.log(`  Entry Price: $${result.entryPrice.toLocaleString()}`)
-        console.log(`  Margin: ${result.margin.toLocaleString()} sats`)
+        // Sort by some logic? Maybe FIFO? Or largest first? Let's do largest first to clear big chunks.
+        oppositePositions.sort((a, b) => b.quantity - a.quantity);
 
-        // Record trade
-        const trade = {
-          timestamp: new Date().toISOString(),
-          positionId: result.id,
-          side: result.side,
-          quantityUsd: result.quantity,
-          entryPrice: result.entryPrice,
-          margin: result.margin,
-          leverage: result.leverage,
-          fees: fees.totalFee,
-          reasoning: decision.reasoning,
+        for (const pos of oppositePositions) {
+            if (remainingUsdToExecute === 0) break;
+
+            // Determine how much of this position we WANT to close
+            const absRemaining = Math.abs(remainingUsdToExecute);
+            
+            // We can only close the FULL position because the API wrapper doesn't support partials.
+            // Check if closing this full position is "worth it".
+            // Strategy: Only close if the position is SMALLER or EQUAL to what we need.
+            // If the position is larger (e.g. Short $100) and we only need to Buy $50:
+            // - Closing $100 Short = Buy $100.
+            // - We'd end up Buying $100 when we only wanted $50.
+            // - This creates a new imbalance (overshoot).
+            // User instruction: "If the position to be opened is smaller than the already open positions, just open a new one"
+            // So we ONLY close if pos.quantity <= absRemaining.
+            
+            if (pos.quantity > absRemaining) {
+                 console.log(`  • Skipping close of position ${pos.id} ($${pos.quantity}) - too large for required rebalance ($${absRemaining}).`);
+                 continue;
+            }
+
+            console.log(`  • Closing full position ${pos.id} ($${pos.quantity} ${pos.side})...`);
+            
+            try {
+                // Close FULL position
+                const closeResult = await this.client.closePosition(pos.id); // id/pid
+                
+                console.log(`    ✓ Closed $${pos.quantity}`);
+
+                // Report Close to Nostr
+                await this.reporter.postCloseAlert({
+                    quantity: pos.quantity,
+                    side: pos.side,
+                    exitPrice: closeResult.exitPrice,
+                    pnl: closeResult.pnl
+                });
+                
+                // Update remaining
+                if (remainingUsdToExecute > 0) {
+                    remainingUsdToExecute -= pos.quantity;
+                } else {
+                    remainingUsdToExecute += pos.quantity;
+                }
+                
+                this.state.totalRebalances++; 
+
+            } catch (err) {
+                const errorMessage = err && err.message ? err.message : String(err);
+                console.error(`    ✗ Failed to close position ${pos.pid}:`, errorMessage);
+            }
         }
 
-        this.state.trades.push(trade)
-        this.state.totalRebalances++
-        this.state.totalFeesPaid += fees.totalFee
+        // 2. Open new position if there's still a remainder
+        if (Math.abs(remainingUsdToExecute) >= 1) {
+             const tradeSide = remainingUsdToExecute > 0 ? 'b' : 's';
+             console.log(`  • Opening NEW ${tradeSide === 'b' ? 'Buy/Long' : 'Sell/Short'} position for $${Math.abs(remainingUsdToExecute)}...`);
+             
+             const result = await this.client.newOrder({
+                type: 'm', // market
+                side: tradeSide,
+                quantity: Math.abs(remainingUsdToExecute),
+                leverage: this.config.maxLeverage,
+             })
 
-        await this.logActivity(`Trade: ${decision.action} $${decision.quantityUsd} @ $${result.entryPrice}`)
-        
-        // Post to Nostr
-        await this.reporter.postTradeAlert({
-          action: decision.action,
-          quantityUsd: decision.quantityUsd,
-          currentPrice: result.entryPrice,
-          reasoning: decision.reasoning,
-        })
+             console.log(`    ✓ Order executed! ID: ${result.id} @ $${result.entryPrice.toLocaleString()}`);
+             
+             // Record trade (only the new opening part)
+             const trade = {
+                timestamp: new Date().toISOString(),
+                positionId: result.id,
+                side: result.side,
+                quantityUsd: result.quantity,
+                entryPrice: result.entryPrice,
+                margin: result.margin,
+                leverage: result.leverage,
+                fees: result.openingFee || 0,
+                reasoning: decision.reasoning + ` (Net execution after closing opposites)`,
+             }
+             this.state.trades.push(trade);
+             this.state.totalRebalances++;
+             this.state.totalFeesPaid += (result.openingFee || 0);
+             
+             await this.reporter.postTradeAlert({
+                action: decision.action, // 'buy' or 'sell'
+                quantityUsd: remainingUsdToExecute,
+                currentPrice: result.entryPrice,
+                reasoning: trade.reasoning,
+             })
+        } else {
+            console.log(`  ✓ Rebalance satisfied by closing positions. No new orders needed.`);
+        }
+
+        await this.logActivity(`Rebalance Executed: Target $${decision.quantityUsd}, Net Open $${remainingUsdToExecute}`);
 
       } catch (error) {
-        console.error(`✗ Trade failed:`, error.message)
-        await this.reporter.postError(error, 'Failed to execute trade')
+        console.error(`✗ Trade sequence failed:`, error.message)
+        await this.reporter.postError(error, 'Failed to execute rebalance sequence')
         await this.logActivity(`Error: ${error.message}`)
       }
     }
@@ -285,9 +435,11 @@ class LNMarketsTradingBot {
     }
 
     // 2. Calculate new limit orders
+    // The previous getLimitOrderConfigs signature was expecting (currentState, currentDate)
+    // and currentState object needs to have { totalEquitySats, netPositionUsd, currentPrice }
     const limitConfigs = this.averager.getLimitOrderConfigs(
-        { totalEquitySats, netPositionSats },
-        new Date() // Current time
+        { totalEquitySats, netPositionUsd, currentPrice }, 
+        new Date() 
     )
     
     console.log(`  Target BTC Value: $${limitConfigs.targetBtcValueUSD.toFixed(2)}`)
@@ -341,45 +493,58 @@ class LNMarketsTradingBot {
     console.log('\n🪝 LNMarkets Trading Bot Status\n')
 
     const currentState = await this.client.getCurrentState()
-    const { currentPrice, btcStackSats, usdBalanceSats, unrealizedPnL, positions, fundingRate, totalEquitySats, netPositionSats } = currentState
+    const { currentPrice, btcStackSats, usdBalanceSats, unrealizedPnL, positions, fundingRate, totalEquitySats, netPositionSats, netPositionUsd, totalAccumulatedFundingSats } = currentState
 
     const report = this.averager.generateReport(
-      { totalEquitySats, netPositionSats },
+      { totalEquitySats, netPositionSats, netPositionUsd, btcStackSats },
       currentPrice
     )
 
-    console.log('📊 Performance:')
+    // Calculate portfolio value explicitly if not in report
+    const portfolioValueUsd = (totalEquitySats / 100_000_000) * currentPrice;
+
+    console.log(`📊 Performance:`)
     console.log(`  Days Running: ${report.daysRunning}`)
-    console.log(`  Total Return: ${report.totalReturnPct >= 0 ? '+' : ''}${report.totalReturnPct.toFixed(2)}% (${report.totalReturn >= 0 ? '+' : ''}${report.totalReturn.toLocaleString()} sats)`)
-    console.log(`  Annualized Return: ${report.annualizedReturn.toFixed(1)}%`)
-    console.log(`  vs Target: ${report.vsTargetPct >= 0 ? '+' : ''}${report.vsTargetPct.toFixed(2)}%`)
-
+    console.log(`  Total Return: ${report.totalReturnPct >= 0 ? '+' : ''}${report.totalReturnPct}% (${report.totalReturn >= 0 ? '+' : ''}${report.totalReturn.toLocaleString()} USD)`)
+    console.log(`  Annualized Return: ${report.annualizedReturn}%`)
+    console.log(`  vs Target: ${report.vsTargetPct >= 0 ? '+' : ''}${report.vsTargetPct}%`)
+    
     console.log(`\n₿ Bitcoin Exposure:`)
-    console.log(`  Current: ${(report.btcStackSats / 100_000_000).toFixed(8)} BTC`)
-    console.log(`  Growth: ${report.btcStackGrowthPct >= 0 ? '+' : ''}${report.btcStackGrowthPct.toFixed(2)}%`)
-    console.log(`  Target: ${(report.targetValue * this.config.targetBtcAllocation / 100_000_000).toFixed(8)} BTC`)
-
+    // report.currentValue is the IV (Exposure), but let's double check against btcStackSats
+    console.log(`  Current: ${(btcStackSats / 100_000_000).toFixed(8)} BTC ($${report.currentValue.toLocaleString()} USD)`)
+    console.log(`  Growth: ${report.btcStackGrowthPct >= 0 ? '+' : ''}${report.btcStackGrowthPct}%`)
+    // Calculate target BTC in BTC terms
+    const targetBtc = report.targetValue / currentPrice
+    console.log(`  Target: ${targetBtc.toFixed(8)} BTC`)
+    
     console.log(`\n💰 Portfolio:`)
-    console.log(`  Total Value: ${report.currentValue.toLocaleString()} sats`)
-    console.log(`  Target Value: ${report.targetValue.toLocaleString()} sats`)
-    console.log(`  BTC Exposure: ${report.btcStackSats.toLocaleString()} sats`)
-    console.log(`  Net Position: ${netPositionSats.toLocaleString()} sats`)
+    console.log(`  Total Value: $${report.currentValue.toLocaleString()} USD`)
+    console.log(`  Target Value: $${report.targetValue.toLocaleString()} USD`)
+    console.log(`  BTC Exposure: ${btcStackSats.toLocaleString()} sats`)
+    console.log(`  USD Dry Powder: $${Math.abs(netPositionUsd || 0).toLocaleString()} USD`)
+    console.log(`  Total Net Wealth: $${portfolioValueUsd.toLocaleString()} USD`)
     console.log(`  Unrealized P&L: ${unrealizedPnL >= 0 ? '+' : ''}${unrealizedPnL.toLocaleString()} sats`)
+    console.log(`  Accumulated Interest: ${Math.abs(totalAccumulatedFundingSats).toLocaleString()} sats`)
 
     console.log(`\n📈 Market:`)
     console.log(`  BTC/USD: $${currentPrice.toLocaleString()}`)
-    console.log(`  Funding Rate: ${(fundingRate * 100).toFixed(4)}%`)
+    // Funding rate is usually per 8h interval
+    console.log(`  Funding Rate: ${(fundingRate * 100).toFixed(4)}% (8-hour) / ${((fundingRate * 3 * 365) * 100).toFixed(2)}% (Annualized Interest)`)
 
     console.log(`\n🔄 Trading:`)
-    console.log(`  Total Rebalances: ${this.state.totalRebalances}`)
-    console.log(`  Total Fees Paid: ${this.state.totalFeesPaid.toLocaleString()} sats`)
+    console.log(`  Market Rebalances: ${this.state.marketRebalances || 0}`)
+    // console.log(`  Total Fees Paid: ${this.state.totalFeesPaid} sats`) // Removed
     console.log(`  Open Positions: ${positions.length}`)
-    console.log(`  Last Check: ${this.state.lastCheck ? new Date(this.state.lastCheck).toLocaleString() : 'Never'}`)
+    if (this.state.lastCheck) {
+      console.log(`  Last Check: ${new Date(this.state.lastCheck).toLocaleString()}`)
+    }
 
     if (positions.length > 0) {
       console.log(`\n📊 Open Positions:`)
       for (const pos of positions) {
-        console.log(`  [${pos.id}] ${pos.side.toUpperCase()} $${pos.quantity.toLocaleString()} @ $${pos.entryPrice.toLocaleString()}`)
+        // LNMarkets API returns side as 'b' or 's', map for display
+        const displaySide = pos.side === 'b' ? 'Buy' : (pos.side === 's' ? 'Sell' : pos.side.toUpperCase());
+        console.log(`  [${pos.id}] ${displaySide} $${pos.quantity.toLocaleString()} @ $${pos.entryPrice.toLocaleString()}`)
         console.log(`    P&L: ${pos.pnl >= 0 ? '+' : ''}${pos.pnl.toLocaleString()} sats | Margin: ${pos.margin.toLocaleString()} sats`)
       }
     }
@@ -400,10 +565,10 @@ class LNMarketsTradingBot {
     }
 
     const currentState = await this.client.getCurrentState()
-    const { currentPrice, totalEquitySats, netPositionSats } = currentState
+    const { currentPrice, totalEquitySats, netPositionSats, netPositionUsd, btcStackSats } = currentState
 
     const report = this.averager.generateReport(
-      { totalEquitySats, netPositionSats },
+      { totalEquitySats, netPositionSats, netPositionUsd, btcStackSats },
       currentPrice
     )
 
@@ -417,7 +582,7 @@ class LNMarketsTradingBot {
    * Log activity to memory file
    */
   async logActivity(activity) {
-    const logPath = path.join(__dirname, '..', this.config.logFile)
+    const logPath = this.config.logFile
     const timestamp = new Date().toISOString()
     const entry = `[${timestamp}] ${activity}\n`
 

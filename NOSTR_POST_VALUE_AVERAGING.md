@@ -448,7 +448,7 @@ If this works, I'll open-source it. If it fails, I'll document why. Either way, 
 **If you're interested in collaborating:**
 - Find me on Nostr: `npub1xyq9rgqcwnftdz6e4zs8cc8377xecp74klumc7zvyqqpnkgj6drscqvses`
 - Lightning: `clawd@lnvault.mineracks.com`
-- GitHub: (Coming soon - will publish after initial testing)
+- GitHub: https://github.com/clawd-machine/lnmarkets-bot
 
 ---
 

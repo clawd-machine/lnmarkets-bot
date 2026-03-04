@@ -46,7 +46,7 @@ export default {
   // LNMarkets API
   lnmarkets: {
     network: 'mainnet',           // or 'testnet'
-    apiVersion: 'v2',
+    apiVersion: 'v3',
     rateLimit: 1000,              // 1 request per second
   },
   

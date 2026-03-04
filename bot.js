@@ -15,10 +15,17 @@ const __dirname = path.dirname(fileURLToPath(import.meta.url))
 class LNMarketsTradingBot {
   constructor(configOverrides = {}) {
     this.config = { ...config, ...configOverrides }
+    this.debug = this.config.debug || false
     this.client = new LNMClient(this.config)
     this.averager = new ValueAverager(this.config)
     this.reporter = new NostrReporter(this.config)
     this.state = null
+  }
+
+  logDebug(...args) {
+    if (this.debug) {
+      console.log('[DEBUG]', ...args)
+    }
   }
 
   /**
@@ -632,7 +639,8 @@ class LNMarketsTradingBot {
 
 // CLI
 const command = process.argv[2]
-const bot = new LNMarketsTradingBot()
+const debug = process.argv.includes('--debug')
+const bot = new LNMarketsTradingBot({ debug })
 
 ;(async () => {
   try {

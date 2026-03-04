@@ -200,6 +200,17 @@ class LNMarketsTradingBot {
     })
     this.state.lastCheck = new Date().toISOString()
 
+    // Log detailed check data
+    await this.logDetailedCheck({
+      currentPrice,
+      deviation: decision.metrics.btcDeviation,
+      actualPortfolioSats: totalEquitySats,
+      targetPortfolioSats: (decision.metrics.targetValue / currentPrice) * 100_000_000,
+      actualBtcExposureUsd: decision.metrics.currentValue,
+      targetBtcExposureUsd: decision.metrics.targetValue,
+      action: decision.needsRebalance ? `${decision.action.toUpperCase()} $${decision.quantityUsd}` : 'No Action'
+    })
+
     if (!decision.needsRebalance) {
       console.log(`\n✓ ${decision.reasoning}`)
       console.log('No immediate market rebalance needed.')
@@ -339,10 +350,29 @@ class LNMarketsTradingBot {
             console.log(`  • Closing full position ${pos.id} ($${pos.quantity} ${pos.side})...`);
             
             try {
+                // Get position state before close
+                const positionBeforeUsd = netPositionUsd;
+                
                 // Close FULL position
                 const closeResult = await this.client.closePosition(pos.id); // id/pid
                 
                 console.log(`    ✓ Closed $${pos.quantity}`);
+
+                // Calculate position after close
+                const positionAfterUsd = pos.side === 'b' 
+                  ? positionBeforeUsd - pos.quantity 
+                  : positionBeforeUsd + pos.quantity;
+
+                // Log detailed trade (close)
+                await this.logDetailedTrade({
+                  side: pos.side === 'b' ? 's' : 'b', // Closing a long = sell, closing short = buy
+                  quantity: pos.quantity,
+                  price: closeResult.exitPrice,
+                  feesSats: closeResult.closingFee || 0,
+                  positionBeforeUsd,
+                  positionAfterUsd,
+                  reason: `Position close - ${decision.reasoning}`
+                });
 
                 // Report Close to Nostr
                 await this.reporter.postCloseAlert({
@@ -359,6 +389,9 @@ class LNMarketsTradingBot {
                     remainingUsdToExecute += pos.quantity;
                 }
                 
+                // Update netPositionUsd for next iteration
+                netPositionUsd = positionAfterUsd;
+                
                 this.state.totalRebalances++; 
 
             } catch (err) {
@@ -372,6 +405,9 @@ class LNMarketsTradingBot {
              const tradeSide = remainingUsdToExecute > 0 ? 'b' : 's';
              console.log(`  • Opening NEW ${tradeSide === 'b' ? 'Buy/Long' : 'Sell/Short'} position for $${Math.abs(remainingUsdToExecute)}...`);
              
+             // Capture position before trade
+             const positionBeforeUsd = netPositionUsd;
+             
              const result = await this.client.newOrder({
                 type: 'm', // market
                 side: tradeSide,
@@ -380,6 +416,22 @@ class LNMarketsTradingBot {
              })
 
              console.log(`    ✓ Order executed! ID: ${result.id} @ $${result.entryPrice.toLocaleString()}`);
+             
+             // Calculate position after trade
+             const positionAfterUsd = tradeSide === 'b'
+               ? positionBeforeUsd + Math.abs(remainingUsdToExecute)
+               : positionBeforeUsd - Math.abs(remainingUsdToExecute);
+             
+             // Log detailed trade (open)
+             await this.logDetailedTrade({
+               side: result.side,
+               quantity: result.quantity,
+               price: result.entryPrice,
+               feesSats: result.openingFee || 0,
+               positionBeforeUsd,
+               positionAfterUsd,
+               reason: `Market rebalance - ${decision.reasoning}`
+             });
              
              // Record trade (only the new opening part)
              const trade = {
@@ -597,6 +649,34 @@ class LNMarketsTradingBot {
       await fs.appendFile(logPath, entry, 'utf8')
     } catch (error) {
       console.error('Failed to write to log:', error.message)
+    }
+  }
+
+  /**
+   * Log detailed check data
+   */
+  async logDetailedCheck(checkData) {
+    const logPath = this.config.logFile
+    const entry = this.client.formatDetailedCheck(checkData)
+
+    try {
+      await fs.appendFile(logPath, entry, 'utf8')
+    } catch (error) {
+      console.error('Failed to write detailed check log:', error.message)
+    }
+  }
+
+  /**
+   * Log detailed trade data
+   */
+  async logDetailedTrade(tradeData) {
+    const logPath = this.config.logFile
+    const entry = this.client.formatDetailedTrade(tradeData)
+
+    try {
+      await fs.appendFile(logPath, entry, 'utf8')
+    } catch (error) {
+      console.error('Failed to write detailed trade log:', error.message)
     }
   }
 

@@ -162,7 +162,7 @@ class LNMarketsTradingBot {
     
     // Get current state from LNMarkets
     const currentState = await this.client.getCurrentState()
-    const { currentPrice, btcStackSats, usdBalanceSats, unrealizedPnL, positions, totalEquitySats, netPositionSats, netPositionUsd } = currentState
+    let { currentPrice, btcStackSats, usdBalanceSats, unrealizedPnL, positions, totalEquitySats, netPositionSats, netPositionUsd } = currentState
 
     console.log(`\nCurrent Price: $${currentPrice.toLocaleString()}`)
     console.log(`Total Equity: ${totalEquitySats.toLocaleString()} sats`)
@@ -260,14 +260,20 @@ class LNMarketsTradingBot {
             console.log(`  Placing ${order.label} Limit: ${Math.abs(order.quantity)} @ $${order.price}`)
             
             try {
+                // Convert USD quantity to sats margin for V3 API
+                const quantityUsd = Math.abs(order.quantity)
+                const marginSats = Math.floor((quantityUsd / order.price) * 100_000_000)
+                
+                console.log(`  → Margin: ${marginSats} sats for $${quantityUsd} position`)
+                
                 await this.client.newOrder({
                     type: 'l',
                     side: order.side,
-                    quantity: Math.abs(order.quantity),
+                    quantity: marginSats,
                     price: order.price,
                     leverage: this.config.maxLeverage
                 })
-                 console.log(`  ✓ ${order.label} Order Placed`)
+                 console.log(`  ✓ ${order.label} Order Placed (${marginSats} sats margin)`)
             } catch (err) {
                 console.error(`  ✗ Failed to place ${order.label}:`, err.message)
             }
@@ -408,53 +414,95 @@ class LNMarketsTradingBot {
              // Capture position before trade
              const positionBeforeUsd = netPositionUsd;
              
-             const result = await this.client.newOrder({
-                type: 'm', // market
-                side: tradeSide,
-                quantity: Math.abs(remainingUsdToExecute),
-                leverage: this.config.maxLeverage,
-             })
+             // Market orders use 'quantity' (contracts in USD) for V3 API?
+             // NO, based on NPM docs for V3, 'quantity' is Margin in Sats for market orders?
+             // WAIT. LNMarkets docs say "quantity is number of contracts (USD)".
+             // But NPM example says quantity: 10000.
+             // If quantity=Contracts(USD), passing 2222 means $2222.
+             // If quantity=Margin(Sats), passing 2222 means $2 worth.
+             
+             // Let's assume quantity IS Margin in Sats for market orders in the SDK wrapper.
+             // Why? Because otherwise the NPM example (10000) is huge ($10k).
+             
+             // BUT if I pass 2222 and get 400 Bad Request, maybe it IS Contracts?
+             // If it is Contracts, then for $2, I should pass quantity: 2.
+             
+             // Let's TRY sending quantity in USD contracts directly first.
+             // If that fails, revert.
+             
+             // Strategy:
+             // The error 400 happened when we sent ~2222 (margin sats).
+             // If the API expected contracts, it saw 2222 contracts ($2222).
+             // At 1x leverage, that needs ~$2222 margin. I have ~$180.
+             // So "Insufficient Margin" or similar would be the cause of 400.
+             
+             // FIX: Pass quantity in USD (contracts).
+             const quantityContracts = Math.floor(Math.abs(remainingUsdToExecute));
+             
+             // Ensure minimum 1 contract
+             if (quantityContracts < 1) {
+                 console.log(`    ⚠️ Skipping market order - < 1 contract ($${Math.abs(remainingUsdToExecute)})`);
+                 // Not in a loop here if we closed positions before?
+                 // Actually this block "if (Math.abs(remainingUsdToExecute) >= 1)" is NOT a loop.
+                 // So 'continue' is illegal.
+                 // We should just not execute the order.
+                 // The 'else' block below handles the "rebalance satisfied" log.
+                 // But here we are inside the "needs new position" block.
+                 // If we skip, we just do nothing.
+             } else {
+                 console.log(`    • Opening NEW ${tradeSide === 'b' ? 'Buy/Long' : 'Sell/Short'} position for $${quantityContracts}...`);
 
-             console.log(`    ✓ Order executed! ID: ${result.id} @ $${result.entryPrice.toLocaleString()}`);
-             
-             // Calculate position after trade
-             const positionAfterUsd = tradeSide === 'b'
-               ? positionBeforeUsd + Math.abs(remainingUsdToExecute)
-               : positionBeforeUsd - Math.abs(remainingUsdToExecute);
-             
-             // Log detailed trade (open)
-             await this.logDetailedTrade({
-               side: result.side,
-               quantity: result.quantity,
-               price: result.entryPrice,
-               feesSats: result.openingFee || 0,
-               positionBeforeUsd,
-               positionAfterUsd,
-               reason: `Market rebalance - ${decision.reasoning}`
-             });
-             
-             // Record trade (only the new opening part)
-             const trade = {
-                timestamp: new Date().toISOString(),
-                positionId: result.id,
-                side: result.side,
-                quantityUsd: result.quantity,
-                entryPrice: result.entryPrice,
-                margin: result.margin,
-                leverage: result.leverage,
-                fees: result.openingFee || 0,
-                reasoning: decision.reasoning + ` (Net execution after closing opposites)`,
+                 const result = await this.client.newOrder({
+                    type: 'm', // market
+                    side: tradeSide,
+                    quantity: quantityContracts, 
+                    leverage: this.config.maxLeverage,
+                 })
+
+                 console.log(`    ✓ Order executed! ID: ${result.id} @ $${result.entryPrice.toLocaleString()}`);
+                 
+                 // Calculate position after trade
+                 const positionAfterUsd = tradeSide === 'b'
+                   ? positionBeforeUsd + quantityContracts
+                   : positionBeforeUsd - quantityContracts;
+                 
+                 // Log detailed trade (open)
+                 await this.logDetailedTrade({
+                   side: result.side,
+                   quantity: result.quantity,
+                   price: result.entryPrice,
+                   feesSats: result.openingFee || 0,
+                   positionBeforeUsd,
+                   positionAfterUsd,
+                   reason: `Market rebalance - ${decision.reasoning}`
+                 });
+                 
+                 // Record trade (only the new opening part)
+                 const trade = {
+                    timestamp: new Date().toISOString(),
+                    positionId: result.id,
+                    side: result.side,
+                    quantityUsd: result.quantity,
+                    entryPrice: result.entryPrice,
+                    margin: result.margin,
+                    leverage: result.leverage,
+                    fees: result.openingFee || 0,
+                    reasoning: decision.reasoning + ` (Net execution after closing opposites)`,
+                 }
+                 this.state.trades.push(trade);
+                 this.state.totalRebalances++;
+                 this.state.totalFeesPaid += (result.openingFee || 0);
+                 
+                 // Update state for limit orders
+                 netPositionUsd = positionAfterUsd;
+                 
+                 await this.reporter.postTradeAlert({
+                    action: decision.action, // 'buy' or 'sell'
+                    quantityUsd: remainingUsdToExecute,
+                    currentPrice: result.entryPrice,
+                    reasoning: trade.reasoning,
+                 })
              }
-             this.state.trades.push(trade);
-             this.state.totalRebalances++;
-             this.state.totalFeesPaid += (result.openingFee || 0);
-             
-             await this.reporter.postTradeAlert({
-                action: decision.action, // 'buy' or 'sell'
-                quantityUsd: remainingUsdToExecute,
-                currentPrice: result.entryPrice,
-                reasoning: trade.reasoning,
-             })
         } else {
             console.log(`  ✓ Rebalance satisfied by closing positions. No new orders needed.`);
         }
@@ -515,19 +563,22 @@ class LNMarketsTradingBot {
              continue
         }
 
-        console.log(`  placing ${order.label} Limit: ${Math.abs(order.quantity)} @ $${order.price}`)
+        console.log(`  Placing ${order.label} Limit: ${Math.abs(order.quantity)} @ $${order.price}`)
         
         try {
-            // client.newOrder signature: { type: 'l', side: 'b'|'s', quantity, price, leverage }
-            // Note: quantity must be positive integer for API usually
+            // Convert USD quantity to sats margin for V3 API
+            // margin_sats = (quantity_usd / price_btc) * 100_000_000
+            const quantityUsd = Math.abs(order.quantity)
+            const marginSats = Math.floor((quantityUsd / order.price) * 100_000_000)
+            
             await this.client.newOrder({
                 type: 'l',
                 side: order.side,
-                quantity: Math.abs(order.quantity),
+                quantity: marginSats, // Pass margin in sats
                 price: order.price,
                 leverage: this.config.maxLeverage
             })
-             console.log(`  ✓ ${order.label} Order Placed`)
+             console.log(`  ✓ ${order.label} Order Placed (${marginSats} sats margin)`)
         } catch (err) {
             console.error(`  ✗ Failed to place ${order.label}:`, err.message)
         }

@@ -32,30 +32,84 @@ class LNMarketsTradingBot {
    * Load state from disk
    */
   async loadState() {
+    let data;
     try {
-      const data = await fs.readFile(this.config.stateFile, 'utf8')
-      this.state = JSON.parse(data)
-      
-      // Restore dates as Date objects
-      if (this.state.startDate) {
-        this.state.startDate = new Date(this.state.startDate)
-        this.averager.initialize(this.state.startDate)
-      }
-
-      // Migrate legacy keys
-      if (this.state.totalRebalances !== undefined && this.state.marketRebalances === undefined) {
-          this.state.marketRebalances = this.state.totalRebalances;
-          delete this.state.totalRebalances;
-      }
-      
-      console.log('✓ State loaded from disk')
-      return this.state
+      data = await fs.readFile(this.config.stateFile, 'utf8')
     } catch (error) {
       if (error.code === 'ENOENT') {
-        console.log('ℹ No existing state found. Run "init" to initialize.')
-        return null
+        const logPath = new URL('./state.log', import.meta.url).pathname
+        try {
+          const logData = await fs.readFile(logPath, 'utf8')
+          const lines = logData.trim().split('\n')
+          if (lines.length > 0) {
+            const lastState = JSON.parse(lines[lines.length - 1])
+            delete lastState._loggedAt
+            console.log('⚠ Recovered state from state.log')
+            data = JSON.stringify(lastState)
+            await fs.writeFile(this.config.stateFile, data, 'utf8')
+          }
+        } catch (recoverErr) {
+          // ignore
+        }
+        if (!data) {
+          console.log('ℹ No existing state found. Run "init" to initialize.')
+          return null
+        }
+      } else {
+        throw error
       }
-      throw error
+    }
+
+    try {
+      this.state = JSON.parse(data)
+    } catch (parseError) {
+      throw new Error('State corrupted: ' + parseError.message)
+    }
+    
+    if (!this.state.version || !this.state.initialCapital) {
+      throw new Error('State validation failed: missing required fields')
+    }
+
+    if (!this.state.metrics) {
+      this.state.metrics = {
+        totalVolumeUsd: 0,
+        totalWins: 0,
+        totalLosses: 0,
+        currentStreak: 0,
+        longestWinningStreak: 0,
+        longestLosingStreak: 0
+      }
+    }
+      
+    // Restore dates as Date objects
+    if (this.state.startDate) {
+      this.state.startDate = new Date(this.state.startDate)
+      this.averager.initialize(this.state.startDate)
+    }
+
+    // Migrate legacy keys
+    if (this.state.totalRebalances !== undefined && this.state.marketRebalances === undefined) {
+        this.state.marketRebalances = this.state.totalRebalances;
+        delete this.state.totalRebalances;
+    }
+    
+    console.log('✓ State loaded from disk')
+    return this.state
+  }
+
+  /**
+   * Log state change to a structured log file (JSONL)
+   */
+  async logStateChange() {
+    const logPath = new URL('./state.log', import.meta.url).pathname
+    try {
+      const entry = JSON.stringify({
+        _loggedAt: new Date().toISOString(),
+        ...this.state
+      }) + '\n'
+      await fs.appendFile(logPath, entry, 'utf8')
+    } catch (err) {
+      console.error('Failed to write to state log:', err.message)
     }
   }
 
@@ -63,6 +117,7 @@ class LNMarketsTradingBot {
    * Save state to disk
    */
   async saveState() {
+    await this.logStateChange()
     await fs.writeFile(
       this.config.stateFile,
       JSON.stringify(this.state, null, 2),
@@ -121,6 +176,14 @@ class LNMarketsTradingBot {
       marketRebalances: 0,
       lastCheck: null,
       version: '1.0.0',
+      metrics: {
+        totalVolumeUsd: 0,
+        totalWins: 0,
+        totalLosses: 0,
+        currentStreak: 0,
+        longestWinningStreak: 0,
+        longestLosingStreak: 0
+      }
     }
     
     // Logic for initialization is fresh, so no migration needed here.
@@ -364,6 +427,19 @@ class LNMarketsTradingBot {
                 
                 console.log(`    ✓ Closed $${pos.quantity}`);
 
+                this.state.metrics.totalVolumeUsd += pos.quantity;
+                const pnl = closeResult.pnl || 0;
+                if (pnl > 0) {
+                  this.state.metrics.totalWins++;
+                  this.state.metrics.currentStreak = this.state.metrics.currentStreak > 0 ? this.state.metrics.currentStreak + 1 : 1;
+                  this.state.metrics.longestWinningStreak = Math.max(this.state.metrics.longestWinningStreak, this.state.metrics.currentStreak);
+                } else if (pnl < 0) {
+                  this.state.metrics.totalLosses++;
+                  this.state.metrics.currentStreak = this.state.metrics.currentStreak < 0 ? this.state.metrics.currentStreak - 1 : -1;
+                  this.state.metrics.longestLosingStreak = Math.max(this.state.metrics.longestLosingStreak, Math.abs(this.state.metrics.currentStreak));
+                }
+                this.state.totalFeesPaid += (closeResult.closingFee || 0);
+
                 // Calculate position after close
                 const positionAfterUsd = pos.side === 'b' 
                   ? positionBeforeUsd - pos.quantity 
@@ -458,6 +534,7 @@ class LNMarketsTradingBot {
                     quantity: quantityContracts, 
                     leverage: this.config.maxLeverage,
                  })
+                 this.state.metrics.totalVolumeUsd += quantityContracts;
 
                  console.log(`    ✓ Order executed! ID: ${result.id} @ $${result.entryPrice.toLocaleString()}`);
                  
@@ -635,6 +712,19 @@ class LNMarketsTradingBot {
     console.log(`  Total Net Wealth: $${portfolioValueUsd.toLocaleString()} USD`)
     console.log(`  Unrealized P&L: ${unrealizedPnL >= 0 ? '+' : ''}${unrealizedPnL.toLocaleString()} sats`)
     console.log(`  Accumulated Interest: ${Math.abs(totalAccumulatedFundingSats).toLocaleString()} sats`)
+
+    console.log(`\n🏆 Cumulative Metrics:`)
+    console.log(`  Total Volume Traded: $${(this.state.metrics.totalVolumeUsd || 0).toLocaleString()} USD`)
+    console.log(`  Total Fees Paid: ${(this.state.totalFeesPaid || 0).toLocaleString()} sats`)
+    const wins = this.state.metrics.totalWins || 0;
+    const losses = this.state.metrics.totalLosses || 0;
+    const totalWL = wins + losses;
+    const winRate = totalWL > 0 ? ((wins / totalWL) * 100).toFixed(1) : 0;
+    console.log(`  Win/Loss Ratio: ${wins}W / ${losses}L (${winRate}%)`)
+    console.log(`  Longest Winning Streak: ${this.state.metrics.longestWinningStreak || 0}`)
+    console.log(`  Longest Losing Streak: ${this.state.metrics.longestLosingStreak || 0}`)
+    const fundingSats = currentState.totalAccumulatedFundingSats || 0;
+    console.log(`  Total Funding ${fundingSats >= 0 ? 'Received' : 'Paid'}: ${Math.abs(fundingSats).toLocaleString()} sats`)
 
     console.log(`\n📈 Market:`)
     console.log(`  BTC/USD: $${currentPrice.toLocaleString()}`)
